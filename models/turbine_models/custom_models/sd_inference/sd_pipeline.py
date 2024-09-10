@@ -41,6 +41,7 @@ import os
 import numpy as np
 import time
 from datetime import datetime as dt
+import pdb
 
 # These are arguments common among submodel exports.
 # They are expected to be populated in two steps:
@@ -227,6 +228,7 @@ class SharkSDPipeline(TurbinePipelineBase):
         target: str | dict[str],
         ireec_flags: str | dict[str] = None,
         attn_spec: str | dict[str] = None,
+        onnx_model_path: str | dict[str] = None,
         decomp_attn: bool | dict[bool] = False,
         pipeline_dir: str = "./shark_vmfbs",
         external_weights_dir: str = "./shark_weights",
@@ -287,6 +289,7 @@ class SharkSDPipeline(TurbinePipelineBase):
             ireec_flags,
             precision,
             attn_spec,
+            onnx_model_path,
             decomp_attn,
             external_weights,
             pipeline_dir,
@@ -720,6 +723,7 @@ class SharkSDPipeline(TurbinePipelineBase):
                 pooled_prompt_embeds,
                 t,
             ]
+            pdb.set_trace()
             noise_pred = self.mmdit(
                 "run_forward",
                 mmdit_inputs,
@@ -754,6 +758,7 @@ class SharkSDPipeline(TurbinePipelineBase):
             prompt = ""
 
         self.cpu_scheduling = cpu_scheduling
+        pdb.set_trace()
         if steps and needs_new_scheduler:
             self.num_inference_steps = steps
             self.load_scheduler(scheduler_id, steps)
@@ -776,6 +781,7 @@ class SharkSDPipeline(TurbinePipelineBase):
             prompt_embeds, negative_embeds = encode_prompt(
                 self, prompt, negative_prompt
             )
+        
 
         for i in range(batch_count):
             produce_latents_input = [
@@ -884,6 +890,9 @@ if __name__ == "__main__":
         "mmdit": args.mmdit_spec if args.mmdit_spec else args.attn_spec,
         "vae": args.vae_spec if args.vae_spec else args.attn_spec,
     }
+    onnx_model_paths = {
+        "mmdit": args.mmdit_onnx_model_path
+    }
     if not args.pipeline_dir:
         args.pipeline_dir = utils.create_safe_name(args.hf_model_name, "")
     benchmark = {}
@@ -913,6 +922,7 @@ if __name__ == "__main__":
         ),
         "vae": args.vae_decomp_attn if args.vae_decomp_attn else args.decomp_attn,
     }
+    # pdb.set_trace()
     sd_pipe = SharkSDPipeline(
         args.hf_model_name,
         args.height,
@@ -924,6 +934,7 @@ if __name__ == "__main__":
         targets,
         ireec_flags,
         specs,
+        onnx_model_paths,
         args.decomp_attn,
         args.pipeline_dir,
         args.external_weights_dir,
@@ -937,8 +948,10 @@ if __name__ == "__main__":
         args.verbose,
         save_outputs=save_outputs,
     )
+    # pdb.set_trace()
     sd_pipe.prepare_all()
     sd_pipe.load_map()
+    # pdb.set_trace()
     sd_pipe.generate_images(
         args.prompt,
         args.negative_prompt,

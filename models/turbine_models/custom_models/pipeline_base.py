@@ -16,6 +16,8 @@ from turbine_models.custom_models.sdxl_inference.pipeline_ir import (
 )
 from turbine_models.utils.sdxl_benchmark import run_benchmark
 from turbine_models.model_runner import vmfbRunner
+import onnxruntime
+import pdb
 
 from PIL import Image
 import gc
@@ -73,6 +75,56 @@ def merge_export_arg(model_map, arg, arg_name):
 #     for item in out:
 #         item = ast.literal_eval(item)
 #     return out
+
+class OnnxPipelineComponent:
+    def __init__(
+        self,
+        printer,
+        dest_type="numpy",
+        dest_dtype="fp16",
+    ):
+        self.ort_session = None
+        self.onnx_file_path = None
+        self.ep = None
+        self.dest_type = dest_type
+        self.dest_dtype = dest_dtype
+        self.printer = printer
+        self.supported_dtypes = ["fp32"]
+        self.default_dtype = "fp32"
+        self.used_dtype = dest_dtype if dest_dtype in self.supported_dtypes else self.default_dtype
+    def load(
+        self,
+        onnx_file_path: str,
+        ep="CPUExecutionProvider"
+    ):
+        self.onnx_file_path = onnx_file_path
+        self.ep = ep
+        
+        self.ort_session = onnxruntime.InferenceSession(onnx_file_path, providers=[ep])
+        self.printer.print(
+            f"Loading {onnx_file_path} into onnxruntime with {ep}."
+        )
+    def unload(self):
+        self.ort_session = None
+        gc.collect()
+
+    # input type only support numpy
+    def _convert_inputs(self, inputs):
+        for iname, inp in inputs:
+            if isinstance(inp, ireert.DeviceArray):
+                inputs[iname] = inp.to_host().astype(np_dtypes[self.used_dtype])
+        return inputs
+    def _convert_output(self, output):
+        return output.astype(np_dtypes[self.dest_dtype])
+    
+    def __call__(self, inputs: list):
+        converted_inputs = self._convert_inputs(inputs)
+        out = self.ort_session.run(
+            None,
+            converted_inputs,
+        )[0]
+        return self._convert_output(out)
+    
 
 
 class PipelineComponent:
@@ -268,6 +320,16 @@ class PipelineComponent:
 
     # def _run_and_validate(self, iree_fn, torch_fn, inputs: list)
 
+class Bcolors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
 
 class Printer:
     def __init__(self, verbose, start_time, print_time):
@@ -284,24 +346,31 @@ class Printer:
 
     def reset(self):
         if self.print_time:
+            print(Bcolors.BOLD + Bcolors.WARNING)
             if self.verbose:
                 self.print("Will now reset clock for printer to 0.0 [s].")
             self.last_print = time.time()
             self.start_time = time.time()
             if self.verbose:
                 self.print("Clock for printer reset to t = 0.0 [s].")
+            print(Bcolors.ENDC, end='')
 
     def print(self, message):
         if self.verbose:
             # Print something like "[t=0.123 dt=0.004] 'message'"
+            print(Bcolors.BOLD + Bcolors.OKCYAN)
             if self.print_time:
                 time_now = time.time()
                 print(
-                    f"[t={time_now - self.start_time:.3f} dt={time_now - self.last_print:.3f}] {message}"
+                    f"[ts={time_now - self.start_time:.3f}s] {message}"
                 )
+                # print(
+                #     f"[t={time_now - self.start_time:.3f} dt={time_now - self.last_print:.3f}] {message}"
+                # )
                 self.last_print = time_now
             else:
                 print(f"{message}")
+            print(Bcolors.ENDC, end='')
 
 
 class TurbinePipelineBase:
@@ -359,6 +428,7 @@ class TurbinePipelineBase:
         ireec_flags: str | dict[str] = None,
         precision: str | dict[str] = "fp16",
         attn_spec: str | dict[str] = None,
+        onnx_model_path: str | dict[str] = None,
         decomp_attn: bool | dict[bool] = False,
         external_weights: str | dict[str] = None,
         pipeline_dir: str = "./shark_vmfbs",
@@ -396,6 +466,7 @@ class TurbinePipelineBase:
         map_arguments = {
             "ireec_flags": ireec_flags,
             "precision": precision,
+            "onnx_model_path": onnx_model_path,
             "attn_spec": attn_spec,
             "decomp_attn": decomp_attn,
             "external_weights": external_weights,
@@ -500,6 +571,8 @@ class TurbinePipelineBase:
         ready = False
         pipeline_dir = self.pipeline_dir
         for key in self.map:
+            if self.map[key]["device"] == "onnx":
+                continue
             missing[key] = []
             # vmfb is already present in model map
             if self.map[key].get("vmfb"):
@@ -761,26 +834,40 @@ class TurbinePipelineBase:
             self.load_submodel(submodel)
 
     def load_submodel(self, submodel):
-        if not self.map[submodel].get("vmfb"):
-            raise ValueError(f"VMFB not found for {submodel}.")
-        if not self.map[submodel].get("weights") and self.map[submodel].get(
-            "external_weights"
-        ):
-            raise ValueError(f"Weights not found for {submodel}.")
-        dest_type = self.map[submodel].get("dest_type", "devicearray")
-        self.map[submodel]["runner"] = PipelineComponent(
-            printer=self.printer,
-            dest_type=dest_type,
-            benchmark=self.map[submodel].get("benchmark", False),
-            save_outputs=self.map[submodel].get("save_outputs", False),
-        )
-        self.map[submodel]["runner"].load(
-            self.map[submodel]["driver"],
-            self.map[submodel]["vmfb"],
-            self.map[submodel]["module_name"],
-            self.map[submodel].get("weights"),
-            self.map[submodel].get("extra_plugin"),
-        )
+        if self.map[submodel]["device"] == "onnx":
+            dest_type = "numpy"
+            dest_dtype = self.map[submodel]["precision"]
+            self.map[submodel]["runner"] = OnnxPipelineComponent(
+                printer=self.printer,
+                dest_type=dest_type,
+                dest_dtype=dest_dtype
+            )
+            ep = "CPUExecutionProvider"
+            self.map[submodel]["runner"].load(
+                onnx_file_path=self.map[submodel]["onnx_model_path"],
+                ep=ep
+            )
+        else:
+            if not self.map[submodel].get("vmfb"):
+                raise ValueError(f"VMFB not found for {submodel}.")
+            if not self.map[submodel].get("weights") and self.map[submodel].get(
+                "external_weights"
+            ):
+                raise ValueError(f"Weights not found for {submodel}.")
+            dest_type = self.map[submodel].get("dest_type", "devicearray")
+            self.map[submodel]["runner"] = PipelineComponent(
+                printer=self.printer,
+                dest_type=dest_type,
+                benchmark=self.map[submodel].get("benchmark", False),
+                save_outputs=self.map[submodel].get("save_outputs", False),
+            )
+            self.map[submodel]["runner"].load(
+                self.map[submodel]["driver"],
+                self.map[submodel]["vmfb"],
+                self.map[submodel]["module_name"],
+                self.map[submodel].get("weights"),
+                self.map[submodel].get("extra_plugin"),
+            )
         setattr(self, submodel, self.map[submodel]["runner"])
 
     def unload_submodel(self, submodel):
